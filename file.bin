@@ -1,0 +1,226 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <DHT.h>
+#include "time.h"
+
+// ---------------- CONFIG ----------------
+const char* ssid = "Percys_Internet";
+const char* password = "41499115";
+
+#define LOG_INTERVAL_MIN 15
+
+// OTA
+String firmwareURL = "YOUR_BIN_URL";
+String versionURL  = "YOUR_VERSION_URL";
+String currentVersion = "1.0";
+
+// Google Sheets
+String serverName = "https://script.google.com/macros/s/AKfycbzb3CmbyqVw55WS7LXYc7njRgpR05ztsv76vuaRWs4RbZ0409EFfbykElAZIJDkmHz0Lw/exec";
+
+// Time
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 4 * 3600;
+
+// Pins
+#define ONE_WIRE_BUS 27
+#define DHTPIN 14
+#define DHTTYPE DHT11
+
+// Struct
+struct Data {
+  float t,h,m1,m2,m3,m4;
+};
+
+// Objects
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+DHT dht(DHTPIN, DHTTYPE);
+
+// RTC memory
+RTC_DATA_ATTR Data buffer[30];
+RTC_DATA_ATTR int bufferIndex = 0;
+RTC_DATA_ATTR int lastLoggedMinute = -1;
+
+// Globals
+float t=0,h=0,m1=0,m2=0,m3=0,m4=0;
+
+// Filter
+float filter(float n,float p){ return 0.7*p + 0.3*n; }
+
+// Validation
+bool valid(float v){
+  return (v != DEVICE_DISCONNECTED_C && v != -127 && v != 85);
+}
+
+// ---------------- OTA CHECK ----------------
+void checkOTA() {
+
+  HTTPClient http;
+  http.begin(versionURL);
+  int code = http.GET();
+
+  if(code == 200) {
+    String newVersion = http.getString();
+    newVersion.trim();
+
+    if(newVersion != currentVersion) {
+      http.end();
+
+      t_httpUpdate_return ret = httpUpdate.update(firmwareURL);
+
+      switch(ret) {
+        case HTTP_UPDATE_FAILED:
+          break;
+        case HTTP_UPDATE_NO_UPDATES:
+          break;
+        case HTTP_UPDATE_OK:
+          break;
+      }
+    }
+  }
+
+  http.end();
+}
+
+// ---------------- WIFI ----------------
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid,password);
+
+  int timeout=0;
+  while(WiFi.status()!=WL_CONNECTED && timeout<20){
+    delay(500);
+    timeout++;
+  }
+  return (WiFi.status()==WL_CONNECTED);
+}
+
+// ---------------- SENSOR ----------------
+void readSensors(){
+
+  float nt = dht.readTemperature();
+  float nh = dht.readHumidity();
+
+  sensors.requestTemperatures();
+
+  float n1=sensors.getTempCByIndex(0);
+  float n2=sensors.getTempCByIndex(1);
+  float n3=sensors.getTempCByIndex(2);
+  float n4=sensors.getTempCByIndex(3);
+
+  if(!isnan(nt)) t=filter(nt,t);
+  if(!isnan(nh)) h=filter(nh,h);
+
+  if(valid(n1)) m1=filter(n1,m1);
+  if(valid(n2)) m2=filter(n2,m2);
+  if(valid(n3)) m3=filter(n3,m3);
+  if(valid(n4)) m4=filter(n4,m4);
+}
+
+// Warmup
+void warmup(){
+  for(int i=0;i<25;i++){
+    readSensors();
+    delay(300);
+  }
+}
+
+// Send
+bool sendRecord(Data d){
+
+  HTTPClient http;
+
+  String url = serverName +
+  "?t="+String(d.t)+
+  "&h="+String(d.h)+
+  "&mx1a="+String(d.m1)+
+  "&mx1b="+String(d.m2)+
+  "&mx2a="+String(d.m3)+
+  "&mx2b="+String(d.m4);
+
+  http.begin(url);
+  int code=http.GET();
+  http.end();
+
+  return(code==200);
+}
+
+// Buffer
+void storeData(Data d){
+  if(bufferIndex<30) buffer[bufferIndex++]=d;
+}
+
+void flushBuffer(){
+  for(int i=0;i<bufferIndex;i++){
+    if(!sendRecord(buffer[i])) return;
+  }
+  bufferIndex=0;
+}
+
+// Sleep
+void goToSleep(struct tm timeinfo){
+
+  int nowSec=timeinfo.tm_min*60+timeinfo.tm_sec;
+
+  int nextMin=((timeinfo.tm_min/LOG_INTERVAL_MIN)+1)*LOG_INTERVAL_MIN;
+  if(nextMin>=60) nextMin=0;
+
+  int targetSec=nextMin*60;
+
+  int sleepSec=targetSec-nowSec;
+  if(sleepSec<=0) sleepSec+=3600;
+
+  esp_sleep_enable_timer_wakeup((uint64_t)sleepSec*1000000ULL);
+  esp_deep_sleep_start();
+}
+
+// ---------------- SETUP ----------------
+void setup(){
+
+  dht.begin();
+  sensors.begin();
+
+  bool wifiOK=connectWiFi();
+
+  if(wifiOK){
+    checkOTA();   // 🔥 OTA CHECK FIRST
+    configTime(gmtOffset_sec,0,ntpServer);
+  }
+
+  struct tm timeinfo;
+  bool timeOK=getLocalTime(&timeinfo);
+
+  warmup();
+
+  if(!timeOK){
+    esp_sleep_enable_timer_wakeup(300000000ULL);
+    esp_deep_sleep_start();
+  }
+
+  int minuteNow=timeinfo.tm_min;
+
+  if((minuteNow % LOG_INTERVAL_MIN == 0) &&
+     (timeinfo.tm_sec < 5) &&
+     (minuteNow != lastLoggedMinute)){
+
+    readSensors();
+
+    Data d={t,h,m1,m2,m3,m4};
+
+    if(wifiOK){
+      flushBuffer();
+      if(!sendRecord(d)) storeData(d);
+    } else {
+      storeData(d);
+    }
+
+    lastLoggedMinute=minuteNow;
+  }
+
+  goToSleep(timeinfo);
+}
+
+void loop(){}
